@@ -1,23 +1,14 @@
 import os
 import pickle
+import sys
+import tempfile
+from copy import deepcopy
+from functools import reduce
+
+import numpy as np
 import torch
 
-from torch.utils.data import DataLoader
-
-from autokeras import constant
-
-
-def lr_schedule(epoch):
-    lr = 1e-3
-    if epoch > 180:
-        lr *= 0.5e-3
-    elif epoch > 160:
-        lr *= 1e-3
-    elif epoch > 120:
-        lr *= 1e-2
-    elif epoch > 80:
-        lr *= 1e-1
-    return lr
+from autokeras.constant import Constant
 
 
 class NoImprovementError(Exception):
@@ -26,7 +17,7 @@ class NoImprovementError(Exception):
 
 
 class EarlyStop:
-    def __init__(self, max_no_improvement_num=constant.MAX_NO_IMPROVEMENT_NUM, min_loss_dec=constant.MIN_LOSS_DEC):
+    def __init__(self, max_no_improvement_num=Constant.MAX_NO_IMPROVEMENT_NUM, min_loss_dec=Constant.MIN_LOSS_DEC):
         super().__init__()
         self.training_losses = []
         self.minimum_loss = None
@@ -34,9 +25,8 @@ class EarlyStop:
         self._max_no_improvement_num = max_no_improvement_num
         self._done = False
         self._min_loss_dec = min_loss_dec
-        self.max_accuracy = 0
 
-    def on_train_begin(self, logs=None):
+    def on_train_begin(self):
         self.training_losses = []
         self._no_improvement_count = 0
         self._done = False
@@ -60,34 +50,46 @@ class EarlyStop:
 
 
 class ModelTrainer:
-    """A class that is used to train model
+    """A class that is used to train the model.
 
-    This class can train a model with dataset and will not stop until getting minimum loss
+    This class can train a Pytorch model with the given data loaders.
+    The metric, loss_function, and model must be compatible with each other.
+    Please see the details in the Attributes.
 
     Attributes:
-        model: the model that will be trained
-        x_train: the input train data
-        y_train: the input train data labels
-        x_test: the input test data
-        y_test: the input test data labels
-        verbose: verbosity mode
+        device: A string. Indicating the device to use. 'cuda' or 'cpu'.
+        model: An instance of Pytorch Module. The model that will be trained.
+        train_loader: Training data wrapped in batches in Pytorch Dataloader.
+        test_loader: Testing data wrapped in batches in Pytorch Dataloader.
+        loss_function: A function with two parameters (prediction, target).
+            There is no specific requirement for the types of the parameters,
+            as long as they are compatible with the model and the data loaders.
+            The prediction should be the output of the model for a batch.
+            The target should be a batch of targets packed in the data loaders.
+        optimizer: The optimizer is chosen to use the Pytorch Adam optimizer.
+        early_stop: An instance of class EarlyStop.
+        metric: It should be a subclass of class autokeras.metric.Metric.
+            In the compute(prediction, target) function, prediction and targets are
+            all numpy arrays converted from the output of the model and the targets packed in the data loaders.
+        verbose: Verbosity mode.
     """
 
-    def __init__(self, model, train_data, test_data, verbose):
-        """Init ModelTrainer with model, x_train, y_train, x_test, y_test, verbose"""
-        self.model = model
-        self.verbose = verbose
-        self.train_data = train_data
-        self.test_data = test_data
+    def __init__(self, model, train_loader, test_loader, metric, loss_function, verbose):
+        """Init the ModelTrainer with `model`, `x_train`, `y_train`, `x_test`, `y_test`, `verbose`"""
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        self.criterion = torch.nn.CrossEntropyLoss()
-        self.optimizer = torch.optim.SGD(model.parameters(), lr=lr_schedule(0), momentum=0.9, weight_decay=5e-4)
+        self.model = model
+        self.model.to(self.device)
+        self.verbose = verbose
+        self.train_loader = train_loader
+        self.test_loader = test_loader
+        self.loss_function = loss_function
+        self.optimizer = None
         self.early_stop = None
+        self.metric = metric
 
     def train_model(self,
-                    max_iter_num=constant.MAX_ITER_NUM,
-                    max_no_improvement_num=constant.MAX_NO_IMPROVEMENT_NUM,
-                    batch_size=constant.MAX_BATCH_SIZE):
+                    max_iter_num=None,
+                    max_no_improvement_num=None):
         """Train the model.
 
         Args:
@@ -95,60 +97,69 @@ class ModelTrainer:
                 The training will stop when this number is reached.
             max_no_improvement_num: An integer. The maximum number of epochs when the loss value doesn't decrease.
                 The training will stop when this number is reached.
-            batch_size: An integer. The batch size during the training.
-            optimizer: An optimizer class.
         """
-        batch_size = min(len(self.train_data), batch_size)
+        if max_iter_num is None:
+            max_iter_num = Constant.MAX_ITER_NUM
 
-        train_loader = DataLoader(self.train_data, batch_size=batch_size, shuffle=True)
-        test_loader = DataLoader(self.test_data, batch_size=batch_size, shuffle=True)
+        if max_no_improvement_num is None:
+            max_no_improvement_num = Constant.MAX_NO_IMPROVEMENT_NUM
 
         self.early_stop = EarlyStop(max_no_improvement_num)
         self.early_stop.on_train_begin()
 
+        test_metric_value_list = []
+        test_loss_list = []
+        self.optimizer = torch.optim.Adam(self.model.parameters())
         for epoch in range(max_iter_num):
-            self._train(train_loader)
-            test_loss = self._test(test_loader)
-            terminate = self.early_stop.on_epoch_end(test_loss)
-            if terminate:
+            self._train()
+            test_loss, metric_value = self._test()
+            test_metric_value_list.append(metric_value)
+            test_loss_list.append(test_loss)
+            if self.verbose:
+                print('Epoch {}: loss {}, metric_value {}'.format(epoch + 1, test_loss, metric_value))
+            decreasing = self.early_stop.on_epoch_end(test_loss)
+            if not decreasing:
+                if self.verbose:
+                    print('No loss decrease after {} epochs'.format(max_no_improvement_num))
                 break
+        return (sum(test_loss_list[-max_no_improvement_num:]) / max_no_improvement_num,
+                sum(test_metric_value_list[-max_no_improvement_num:]) / max_no_improvement_num)
 
-    def _train(self, loader):
+    def _train(self):
         self.model.train()
-        train_loss = 0
-        correct = 0
-        total = 0
-        for batch_idx, (inputs, targets) in enumerate(loader):
-            targets = targets.argmax(1)
+        loader = self.train_loader
+
+        for batch_idx, (inputs, targets) in enumerate(deepcopy(loader)):
             inputs, targets = inputs.to(self.device), targets.to(self.device)
             self.optimizer.zero_grad()
             outputs = self.model(inputs)
-            loss = self.criterion(outputs, targets)
+            loss = self.loss_function(outputs, targets)
             loss.backward()
             self.optimizer.step()
+            if self.verbose:
+                if batch_idx % 10 == 0:
+                    print('.', end='')
+                    sys.stdout.flush()
+        if self.verbose:
+            print()
 
-            train_loss += loss.item()
-            _, predicted = outputs.max(1)
-            total += targets.size(0)
-            correct += predicted.eq(targets).sum().item()
-
-    def _test(self, test_loader):
+    def _test(self):
         self.model.eval()
         test_loss = 0
-        correct = 0
-        total = 0
+        all_targets = []
+        all_predicted = []
+        loader = self.test_loader
         with torch.no_grad():
-            for batch_idx, (inputs, targets) in enumerate(test_loader):
-                targets = targets.argmax(1)
+            for batch_idx, (inputs, targets) in enumerate(deepcopy(loader)):
                 inputs, targets = inputs.to(self.device), targets.to(self.device)
                 outputs = self.model(inputs)
-                loss = self.criterion(outputs, targets)
+                test_loss += self.loss_function(outputs, targets)
 
-                test_loss += loss.item()
-                _, predicted = outputs.max(1)
-                total += targets.size(0)
-                correct += predicted.eq(targets).sum().item()
-        return test_loss
+                all_predicted.append(outputs.cpu().numpy())
+                all_targets.append(targets.cpu().numpy())
+        all_predicted = reduce(lambda x, y: np.concatenate((x, y)), all_predicted)
+        all_targets = reduce(lambda x, y: np.concatenate((x, y)), all_targets)
+        return test_loss, self.metric.compute(all_predicted, all_targets)
 
 
 def ensure_dir(directory):
@@ -172,3 +183,11 @@ def pickle_from_file(path):
 
 def pickle_to_file(obj, path):
     pickle.dump(obj, open(path, 'wb'))
+
+
+def temp_folder_generator():
+    sys_temp = tempfile.gettempdir()
+    path = os.path.join(sys_temp, 'autokeras')
+    if not os.path.exists(path):
+        os.makedirs(path)
+    return path

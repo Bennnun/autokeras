@@ -1,6 +1,12 @@
+# Mkdocs
+/docs/
+/mkdocs/docs/index.md
+/mkdocs/docs/temp
+
 .DS_Store
 .idea
 .pytest_cache
+/experiments
 
 # resource temp folder
 tests/resources/temp/*
